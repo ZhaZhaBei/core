@@ -1,0 +1,60 @@
+name: R118 same-runner baseline comparison
+on:
+  push:
+    branches: [codex/ci-6096-r118-baseline-20261031]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: section
+            test: tests/components/primitive-components/schematic-section-chip-title-clearance.test.tsx
+          - kind: spice
+            test: tests/features/spice-analysis/voltagesource-pulse-timing-controls.test.tsx
+          - kind: cad
+            test: tests/examples/example38-cad-model-placement.test.tsx
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies without lifecycle scripts
+        run: bun install --ignore-scripts
+      - name: Prepare pristine baseline with identical dependencies
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/baseline" bdd7044b3df2d67d767c7d1e7745376646ffb8b2
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$RUNNER_TEMP/baseline/node_modules"
+          bun pm ls > "$RUNNER_TEMP/dependency-tree.log"
+      - name: Compare identical test in isolated network namespaces
+        shell: bash
+        env:
+          TEST_FILE: ${{ matrix.test }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/safehome" "$RUNNER_TEMP/safetmp" "$RUNNER_TEMP/comparison"
+          for version in baseline candidate; do
+            if [ "$version" = baseline ]; then test_dir="$RUNNER_TEMP/baseline"; else test_dir="$GITHUB_WORKSPACE"; fi
+            set +e
+            sudo unshare --net env R118_RUN_UID="$(id -u)" R118_RUN_GID="$(id -g)" R118_BUN="$(command -v bun)" R118_TEST="$TEST_FILE" R118_DIR="$test_dir" R118_HOME="$RUNNER_TEMP/safehome" R118_TMP="$RUNNER_TEMP/safetmp" R118_PATH="$PATH" bash -c 'set -e; ip link set lo up; cd "$R118_DIR"; exec setpriv --reuid="$R118_RUN_UID" --regid="$R118_RUN_GID" --init-groups env -i PATH="$R118_PATH" HOME="$R118_HOME" TMPDIR="$R118_TMP" CI=true "$R118_BUN" test "$R118_TEST" --timeout 30000' 2>&1 | tee "$RUNNER_TEMP/comparison/$version.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            echo "$code" > "$RUNNER_TEMP/comparison/$version.exit"
+            echo "R118_COMPARE $version exit=$code"
+          done
+          cp "$RUNNER_TEMP/dependency-tree.log" "$RUNNER_TEMP/comparison/dependency-tree.log"
+          test "$(cat "$RUNNER_TEMP/comparison/candidate.exit")" = 0
+      - name: Upload exact comparison logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-comparison-${{ matrix.kind }}
+          path: ${{ runner.temp }}/comparison/
+          if-no-files-found: warn
