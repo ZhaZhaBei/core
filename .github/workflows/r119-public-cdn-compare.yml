@@ -1,7 +1,7 @@
 name: R119 isolated read-only CDN comparison
 on:
   push:
-    branches: [codex/ci-6096-r119-cdn-only]
+    branches: [codex/ci-6096-r119-comparison-complete]
 permissions:
   contents: read
 jobs:
