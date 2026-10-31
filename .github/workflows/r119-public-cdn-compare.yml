@@ -1,0 +1,68 @@
+name: R119 isolated read-only CDN comparison
+on:
+  push:
+    branches: [codex/ci-6096-r119-cdn-only]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies without lifecycle scripts
+        run: bun install --ignore-scripts
+      - name: Prepare isolated source copies and public fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/r119/secret" "$RUNNER_TEMP/r119/output" "$RUNNER_TEMP/r119/base" "$RUNNER_TEMP/r119/candidate"
+          git archive bdd7044b3df2d67d767c7d1e7745376646ffb8b2 | tar -x -C "$RUNNER_TEMP/r119/base"
+          git archive 6a59fbae63c91b148004c0980a2f5446dbe9884d | tar -x -C "$RUNNER_TEMP/r119/candidate"
+          cp .github/validation/r119-failing-tests.txt "$RUNNER_TEMP/r119/tests.txt"
+          test "$(wc -l < "$RUNNER_TEMP/r119/tests.txt")" -eq 25
+          sudo chown -R 65534:65534 "$RUNNER_TEMP/r119/base" "$RUNNER_TEMP/r119/candidate"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=R119 ephemeral test CA' -keyout "$RUNNER_TEMP/r119/secret/ca.key" -out "$RUNNER_TEMP/r119/ca.crt" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -subj '/CN=jscdn.tscircuit.com' -keyout "$RUNNER_TEMP/r119/secret/server.key" -out "$RUNNER_TEMP/r119/secret/server.csr" >/dev/null 2>&1
+          printf 'subjectAltName=DNS:jscdn.tscircuit.com,DNS:modelcdn.tscircuit.com\nextendedKeyUsage=serverAuth\n' > "$RUNNER_TEMP/r119/secret/extensions"
+          openssl x509 -req -in "$RUNNER_TEMP/r119/secret/server.csr" -CA "$RUNNER_TEMP/r119/ca.crt" -CAkey "$RUNNER_TEMP/r119/secret/ca.key" -CAcreateserial -days 1 -extfile "$RUNNER_TEMP/r119/secret/extensions" -out "$RUNNER_TEMP/r119/secret/server.crt" >/dev/null 2>&1
+          docker network create --internal --subnet 172.29.119.0/24 r119-internal
+          network_id=$(docker network inspect r119-internal --format '{{.Id}}')
+          bridge="br-${network_id:0:12}"
+          sudo iptables -I INPUT 1 -i "$bridge" -p tcp --dport 18888 -j ACCEPT
+          sudo iptables -I INPUT 2 -i "$bridge" -j DROP
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" R119_CERT="$RUNNER_TEMP/r119/secret/server.crt" R119_KEY="$RUNNER_TEMP/r119/secret/server.key" python3 -u .github/validation/r119_readonly_cdn_proxy.py > "$RUNNER_TEMP/r119/output/proxy.log" 2>&1 &
+          for i in {1..30}; do grep -q '^READY' "$RUNNER_TEMP/r119/output/proxy.log" && break; sleep 1; done
+          grep -q '^READY' "$RUNNER_TEMP/r119/output/proxy.log"
+          docker pull oven/bun:1.4.2
+      - name: Validate outbound policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network r119-internal --cap-drop ALL --security-opt no-new-privileges --read-only --user 65534:65534 --tmpfs /tmp:rw,nosuid,nodev --workdir /tmp -e HOME=/tmp -e HTTPS_PROXY=http://172.29.119.1:18888 -e HTTP_PROXY=http://172.29.119.1:18888 -e NODE_EXTRA_CA_CERTS=/ca.crt -e SSL_CERT_FILE=/ca.crt -e NO_PROXY=localhost,127.0.0.1 -v "$RUNNER_TEMP/r119/ca.crt:/ca.crt:ro" oven/bun:1.4.2 bun -e 'const u="https://modelcdn.tscircuit.com/easyeda_models/assets/C165948.obj?uuid=617b05f9bba7410b96c001093d8189e4"; const a=await fetch(u); if(!a.ok) throw Error("allowed GET failed "+a.status); await a.arrayBuffer(); const b=await fetch(u,{method:"POST"}); if(b.status!==403) throw Error("POST not blocked"); const c=await fetch(u,{headers:{Authorization:"never-send-test"}}); if(c.status!==403) throw Error("authorization not blocked"); try { await fetch("https://example.com",{signal:AbortSignal.timeout(4000)}); throw Error("other host not blocked"); } catch(e) {if(String(e).includes("other host not blocked")) throw e;} try {await fetch("https://example.com",{proxy:false,signal:AbortSignal.timeout(4000)}); throw Error("direct egress not blocked");} catch(e) {if(String(e).includes("direct egress not blocked")) throw e;} console.log("GET allowlist, POST, auth, domain, direct-egress controls passed")'
+      - name: Compare targeted baseline and candidate files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < "$RUNNER_TEMP/r119/tests.txt"
+          for version in base candidate; do
+            set +e
+            docker run --rm --network r119-internal --cap-drop ALL --security-opt no-new-privileges --read-only --user 65534:65534 --tmpfs /tmp:rw,nosuid,nodev --workdir /work -e HOME=/tmp -e CI=true -e HTTPS_PROXY=http://172.29.119.1:18888 -e HTTP_PROXY=http://172.29.119.1:18888 -e NODE_EXTRA_CA_CERTS=/ca.crt -e SSL_CERT_FILE=/ca.crt -e NO_PROXY=localhost,127.0.0.1 -v "$RUNNER_TEMP/r119/$version:/work:rw" -v "$GITHUB_WORKSPACE/node_modules:/work/node_modules:ro" -v "$RUNNER_TEMP/r119/ca.crt:/ca.crt:ro" oven/bun:1.4.2 bun test "${tests[@]}" --timeout 30000 2>&1 | tee "$RUNNER_TEMP/r119/output/$version.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            echo "$code" > "$RUNNER_TEMP/r119/output/$version.exit"
+            echo "R119_PUBLIC_GET $version exit=$code"
+          done
+          test "$(cat "$RUNNER_TEMP/r119/output/candidate.exit")" = 0
+      - name: Upload evidence without secrets
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r119-readonly-public-cdn-comparison
+          path: ${{ runner.temp }}/r119/output/
+          if-no-files-found: warn
