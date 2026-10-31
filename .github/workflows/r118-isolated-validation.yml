@@ -32,12 +32,10 @@ jobs:
           mapfile -t test_files < ".github/test-plans/node${{ matrix.node }}-testplan.txt"
           test "${#test_files[@]}" -gt 0
           mkdir -p "$RUNNER_TEMP/isolated-home" "$RUNNER_TEMP/isolated-tmp"
-          sudo iptables -I OUTPUT 1 ! -o lo -j REJECT
-          trap 'sudo iptables -D OUTPUT 1 || true' EXIT
           attempt=1
           while [ "$attempt" -le 4 ]; do
             set +e
-            env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bun test "${test_files[@]}" --timeout 30000 2>&1 | tee ".github/test-plans/node${{ matrix.node }}-attempt${attempt}.log"
+            sudo unshare --net env R118_RUN_UID="$(id -u)" R118_RUN_GID="$(id -g)" R118_BUN="$(command -v bun)" R118_HOME="$RUNNER_TEMP/isolated-home" R118_TMP="$RUNNER_TEMP/isolated-tmp" R118_PATH="$PATH" bash -c 'set -e; ip link set lo up; exec setpriv --reuid="$R118_RUN_UID" --regid="$R118_RUN_GID" --init-groups env -i PATH="$R118_PATH" HOME="$R118_HOME" TMPDIR="$R118_TMP" CI=true "$R118_BUN" test "$@" --timeout 30000' _ "${test_files[@]}" 2>&1 | tee ".github/test-plans/node${{ matrix.node }}-attempt${attempt}.log"
             code=${PIPESTATUS[0]}
             set -e
             if [ "$code" -eq 0 ]; then exit 0; fi
@@ -69,7 +67,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/isolated-home" "$RUNNER_TEMP/isolated-tmp"
-          sudo iptables -I OUTPUT 1 ! -o lo -j REJECT
-          trap 'sudo iptables -D OUTPUT 1 || true' EXIT
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bunx tsc --noEmit
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bun run build
+          for task in typecheck build; do
+            sudo unshare --net env R118_RUN_UID="$(id -u)" R118_RUN_GID="$(id -g)" R118_BUN="$(command -v bun)" R118_HOME="$RUNNER_TEMP/isolated-home" R118_TMP="$RUNNER_TEMP/isolated-tmp" R118_PATH="$PATH" R118_TASK="$task" bash -c 'set -e; ip link set lo up; if [ "$R118_TASK" = typecheck ]; then set -- x tsc --noEmit; else set -- run build; fi; exec setpriv --reuid="$R118_RUN_UID" --regid="$R118_RUN_GID" --init-groups env -i PATH="$R118_PATH" HOME="$R118_HOME" TMPDIR="$R118_TMP" CI=true "$R118_BUN" "$@"'
+          done
