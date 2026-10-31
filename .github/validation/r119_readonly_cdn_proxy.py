@@ -22,6 +22,7 @@ ASSETS = {
   "C93965": "2d0fd2703afb4f81a9dfc54e2181a624",
 }
 DOWNLOADS = {"4e90b6d8552a4e058d9ebe9d82e11f3a": "C9900017879", "76b360a9d4c54384a4e47d7e5af156df": "C2040"}
+API_ASSETS = {"/api/easyeda_models/assets/C9900017879.obj": "4e90b6d8552a4e058d9ebe9d82e11f3a", "/api/easyeda_models/assets/C2040.obj": "76b360a9d4c54384a4e47d7e5af156df"}
 
 def allowed_get(host, path):
     p = urllib.parse.urlsplit(path)
@@ -42,6 +43,8 @@ def allowed_get(host, path):
     query.pop("cachebust_origin", None)
     if p.path == "/easyeda_models/download":
         return len(query) == 2 and DOWNLOADS.get(query.get("uuid")) == query.get("pn")
+    if p.path in API_ASSETS:
+        return len(query) == 1 and query.get("uuid") == API_ASSETS[p.path]
     import re
     match = re.fullmatch(r"/easyeda_models/assets/(C[0-9]+)\.(obj|step)", p.path)
     return bool(match and len(query) == 1 and ASSETS.get(match.group(1)) == query.get("uuid"))
@@ -109,8 +112,16 @@ class Handler(socketserver.BaseRequestHandler):
             response = conn.getresponse()
             # Never follow redirects or forward authentication, cookies, or request headers.
             if 300 <= response.status < 400:
-                tls.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
-                print('DENY_REDIRECT', host, clean, response.status, flush=True)
+                location = response.getheader('Location', '')
+                destination = urllib.parse.urlsplit(urllib.parse.urljoin('https://' + host + path, location))
+                target = urllib.parse.urlunsplit(('', '', destination.path, destination.query, ''))
+                if not location or destination.scheme != 'https' or destination.netloc != host or not allowed_get(host, target):
+                    tls.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+                    print('DENY_REDIRECT', flush=True)
+                    return
+                tls.sendall((f'HTTP/1.1 {response.status} Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n').encode('ascii'))
+                print('ALLOW_SAFE_REDIRECT', host, destination.path, flush=True)
+                conn.close()
                 return
             headers = [f'HTTP/1.1 {response.status} {response.reason}', 'Connection: close']
             for name in ('Content-Type', 'Content-Length', 'Content-Encoding'):
