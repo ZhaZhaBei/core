@@ -32,7 +32,8 @@ jobs:
         run: |
           git worktree add --detach "$RUNNER_TEMP/baseline" bdd7044b3df2d67d767c7d1e7745376646ffb8b2
           ln -s "$GITHUB_WORKSPACE/node_modules" "$RUNNER_TEMP/baseline/node_modules"
-          bun pm ls > "$RUNNER_TEMP/dependency-tree.log"
+          printf "Candidate and baseline share one node_modules; Bun version: " > "$RUNNER_TEMP/dependency-tree.log"
+          bun --version >> "$RUNNER_TEMP/dependency-tree.log"
       - name: Compare identical test in isolated network namespaces
         shell: bash
         env:
