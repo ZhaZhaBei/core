@@ -1,0 +1,75 @@
+name: R118 isolated validation
+on:
+  push:
+    branches: [codex/ci-6096-r118-20261031]
+permissions:
+  contents: read
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install isolated dependencies without lifecycle scripts
+        run: bun install --ignore-scripts
+      - name: Generate project test plans
+        env:
+          TEST_PLAN_NODE_COUNT: 10
+        run: bun run scripts/generate-test-plan.ts
+      - name: Run project test shard with outbound traffic blocked
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t test_files < ".github/test-plans/node${{ matrix.node }}-testplan.txt"
+          test "${#test_files[@]}" -gt 0
+          mkdir -p "$RUNNER_TEMP/isolated-home" "$RUNNER_TEMP/isolated-tmp"
+          sudo iptables -I OUTPUT 1 ! -o lo -j REJECT
+          trap 'sudo iptables -D OUTPUT 1 || true' EXIT
+          attempt=1
+          while [ "$attempt" -le 4 ]; do
+            set +e
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bun test "${test_files[@]}" --timeout 30000 2>&1 | tee ".github/test-plans/node${{ matrix.node }}-attempt${attempt}.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            if [ "$code" -eq 0 ]; then exit 0; fi
+            if [ "$code" -ne 139 ] && [ "$code" -ne 132 ]; then exit "$code"; fi
+            if [ "$attempt" -eq 4 ]; then exit "$code"; fi
+            attempt=$((attempt+1))
+          done
+      - name: Upload actual test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-test-logs-${{ matrix.node }}
+          path: .github/test-plans/node${{ matrix.node }}-attempt*.log
+          if-no-files-found: ignore
+  build-type:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install isolated dependencies without lifecycle scripts
+        run: bun install --ignore-scripts
+      - name: Typecheck and build with outbound traffic blocked
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/isolated-home" "$RUNNER_TEMP/isolated-tmp"
+          sudo iptables -I OUTPUT 1 ! -o lo -j REJECT
+          trap 'sudo iptables -D OUTPUT 1 || true' EXIT
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bunx tsc --noEmit
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/isolated-home" TMPDIR="$RUNNER_TEMP/isolated-tmp" CI=true bun run build
